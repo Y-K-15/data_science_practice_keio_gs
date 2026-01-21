@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from stvis import pv_static
 
 from build_vectors import build_song_vectors
 from graph import build_pyvis_graph
-from recommend import build_similarity_cache, get_topk_similar
+from recommend import EMOTION_COLUMNS, build_similarity_cache, get_topk_similar
+from vis_component import vis_network
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -62,19 +63,34 @@ def format_labels(song_vectors: pd.DataFrame) -> pd.Series:
     return base
 
 
+def parse_px(value: str, default: int) -> int:
+    try:
+        return int(str(value).replace("px", ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def options_to_dict(options) -> dict:
+    if hasattr(options, "to_json"):
+        return json.loads(options.to_json())
+    if isinstance(options, str):
+        return json.loads(options)
+    if isinstance(options, dict):
+        return options
+    return {}
+
+
 def build_extra_edges(
     song_vectors: pd.DataFrame,
     source_keys: list[str],
     expand_k: int,
-    similarity_cache: pd.DataFrame | None,
     query_key: str,
+    topk_func,
 ) -> pd.DataFrame:
     rows = []
     for source_key in source_keys:
         source_key = str(source_key)
-        neighbors = get_topk_similar(
-            song_vectors, source_key, expand_k, similarity_cache=similarity_cache
-        )
+        neighbors = topk_func(source_key, expand_k)
         for row in neighbors.itertuples(index=False):
             target_key = str(row.song_key)
             if target_key == query_key:
@@ -89,6 +105,99 @@ def build_extra_edges(
     if not rows:
         return pd.DataFrame(columns=["source_key", "target_key", "similarity"])
     return pd.DataFrame(rows).drop_duplicates()
+
+
+def empty_edges_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["source_key", "target_key", "similarity"])
+
+
+SIM_METHODS = {
+    "raw": {
+        "label": "raw cosine",
+        "desc": "28次元をそのままL2正規化してcosineを計算",
+    },
+    "no_neutral": {
+        "label": "cosine without neutral",
+        "desc": "neutral列を除外してcosineを計算",
+    },
+    "mean_center": {
+        "label": "mean-centered cosine",
+        "desc": "全曲平均ベクトルを引いてからcosineを計算",
+    },
+    "zscore": {
+        "label": "zscore cosine",
+        "desc": "各列をz-score標準化してからcosineを計算（stdの下限を確保）",
+    },
+    "weighted": {
+        "label": "weighted pooling (1-neutral)",
+        "desc": "neutralが高い行ほど重みを下げるイメージで、(1-neutral)をスカラーで掛けてcosineを計算",
+    },
+}
+
+
+@st.cache_data(show_spinner=False)
+def prepare_matrix(song_vectors: pd.DataFrame, method: str) -> np.ndarray:
+    df = song_vectors[EMOTION_COLUMNS].copy()
+    method = method if method in SIM_METHODS else "raw"
+
+    if method == "no_neutral" and "neutral" in df.columns:
+        df = df.drop(columns=["neutral"])
+    elif method == "mean_center":
+        mu = df.mean()
+        df = df - mu
+    elif method == "zscore":
+        mu = df.mean()
+        std = df.std()
+        std = std.replace(0, 1e-6)
+        df = (df - mu) / std
+    elif method == "weighted":
+        if "neutral" in df.columns:
+            w = 1.0 - df["neutral"].clip(lower=0.0, upper=1.0)
+        else:
+            w = 1.0
+        df = df.mul(w, axis=0)
+
+    return df.to_numpy(dtype=float)
+
+
+def compute_topk_from_matrix(
+    song_vectors: pd.DataFrame, matrix: np.ndarray, song_key: str, k: int
+) -> pd.DataFrame:
+    if k <= 0:
+        raise ValueError("k must be >= 1")
+
+    if "song_key" not in song_vectors.columns:
+        raise ValueError("song_vectors must include 'song_key'")
+
+    keys = song_vectors["song_key"].astype(str).tolist()
+    try:
+        query_idx = keys.index(str(song_key))
+    except ValueError:
+        raise ValueError(f"song_key not found: {song_key}")
+
+    # L2正規化
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-12
+    mat_norm = matrix / norms
+
+    sims = mat_norm[[query_idx]] @ mat_norm.T
+    sims = sims.flatten()
+    sims[query_idx] = -np.inf
+
+    max_k = min(k, len(sims) - 1) if len(sims) > 1 else 0
+    if max_k <= 0:
+        return pd.DataFrame(columns=["similarity", "song_key"])
+
+    if max_k < len(sims):
+        top_idx = np.argpartition(sims, -max_k)[-max_k:]
+    else:
+        top_idx = np.arange(len(sims))
+    top_idx = top_idx[np.argsort(sims[top_idx])[::-1]]
+
+    meta_cols = [c for c in ["title", "artist", "year", "n_lines"] if c in song_vectors.columns]
+    result = song_vectors.loc[top_idx, ["song_key"] + meta_cols].copy()
+    result.insert(0, "similarity", sims[top_idx])
+    return result.reset_index(drop=True)
 
 
 st.set_page_config(page_title="Emotion Similarity Explorer", layout="wide")
@@ -142,10 +251,31 @@ selected_key = st.sidebar.selectbox(
 max_k = max(1, min(50, len(song_vectors) - 1))
 selected_k = st.sidebar.slider("Top-K", min_value=1, max_value=max_k, value=min(10, max_k))
 
-expand_graph = st.sidebar.checkbox("Expand 2-hop neighbors", value=False)
-expand_k = 3
-if expand_graph:
-    expand_k = st.sidebar.slider("2-hop per neighbor", min_value=1, max_value=10, value=3)
+method_keys = list(SIM_METHODS.keys())
+selected_method = st.sidebar.selectbox(
+    "Similarity method",
+    method_keys,
+    format_func=lambda k: SIM_METHODS[k]["label"],
+)
+
+if "show_method_help" not in st.session_state:
+    st.session_state.show_method_help = False
+
+if st.sidebar.button("説明を表示/非表示"):
+    st.session_state.show_method_help = not st.session_state.show_method_help
+
+if st.session_state.show_method_help:
+    st.sidebar.info(
+        "\n".join(
+            [
+                f"- {SIM_METHODS[k]['label']}: {SIM_METHODS[k]['desc']}"
+                for k in method_keys
+            ]
+        )
+    )
+
+st.sidebar.subheader("Graph controls")
+expand_k = st.sidebar.slider("Expand neighbors per click", min_value=1, max_value=10, value=3)
 
 similarity_threshold = st.sidebar.slider(
     "Min similarity (graph)", min_value=0.0, max_value=1.0, value=0.0, step=0.01
@@ -170,6 +300,38 @@ if st.sidebar.button("Build similarity cache (current K)"):
             st.sidebar.error(str(exc))
     st.rerun()
 
+if "expanded_keys" not in st.session_state:
+    st.session_state.expanded_keys = []
+if "expanded_edges" not in st.session_state:
+    st.session_state.expanded_edges = empty_edges_df()
+if "focus_key" not in st.session_state:
+    st.session_state.focus_key = selected_key
+if "last_click_ts" not in st.session_state:
+    st.session_state.last_click_ts = 0
+if "last_expand_k" not in st.session_state:
+    st.session_state.last_expand_k = expand_k
+
+if st.session_state.get("current_query_key") != selected_key:
+    st.session_state.current_query_key = selected_key
+    st.session_state.expanded_keys = []
+    st.session_state.expanded_edges = empty_edges_df()
+    st.session_state.focus_key = selected_key
+    st.session_state.last_click_ts = 0
+
+if st.session_state.last_expand_k != expand_k:
+    st.session_state.last_expand_k = expand_k
+    st.session_state.expanded_keys = []
+    st.session_state.expanded_edges = empty_edges_df()
+    st.session_state.focus_key = selected_key
+    st.session_state.last_click_ts = 0
+
+if st.sidebar.button("Reset graph"):
+    st.session_state.expanded_keys = []
+    st.session_state.expanded_edges = empty_edges_df()
+    st.session_state.focus_key = selected_key
+    st.session_state.last_click_ts = 0
+    st.rerun()
+
 query_row = get_song_row(song_index, selected_key)
 
 st.subheader("Query song")
@@ -186,6 +348,15 @@ meta_lines.append(f"Song key: {selected_key}")
 st.write(" | ".join(meta_lines))
 
 neighbors = get_topk_similar(song_vectors, selected_key, selected_k, similarity_cache=cache_df)
+matrix_override = None
+if selected_method == "raw":
+    neighbors = get_topk_similar(
+        song_vectors, selected_key, selected_k, similarity_cache=cache_df
+    )
+else:
+    matrix_override = prepare_matrix(song_vectors, selected_method)
+    neighbors = compute_topk_from_matrix(song_vectors, matrix_override, selected_key, selected_k)
+
 if not neighbors.empty:
     neighbors["song_key"] = neighbors["song_key"].astype(str)
 
@@ -195,19 +366,20 @@ if neighbors.empty:
 else:
     st.dataframe(neighbors, use_container_width=True)
 
-extra_edges = None
-if expand_graph and not neighbors.empty:
-    max_sources = min(len(neighbors), 5)
-    source_keys = neighbors["song_key"].astype(str).head(max_sources).tolist()
-    extra_edges = build_extra_edges(
-        song_vectors,
-        source_keys,
-        expand_k,
-        similarity_cache=cache_df,
-        query_key=selected_key,
+def _topk_func(song_key: str, k: int) -> pd.DataFrame:
+    if selected_method == "raw":
+        return get_topk_similar(song_vectors, song_key, k, similarity_cache=cache_df)
+    mat = matrix_override if matrix_override is not None else prepare_matrix(
+        song_vectors, selected_method
     )
+    return compute_topk_from_matrix(song_vectors, mat, song_key, k)
+
+extra_edges = None
+if not st.session_state.expanded_edges.empty:
+    extra_edges = st.session_state.expanded_edges
 
 st.subheader("Connected graph")
+st.caption("Click a node to expand its neighborhood. Use Reset graph to clear.")
 if neighbors.empty:
     st.info("Select a song with available neighbors to render the graph.")
 else:
@@ -218,4 +390,38 @@ else:
         extra_edges=extra_edges,
         similarity_threshold=similarity_threshold if similarity_threshold > 0 else None,
     )
-    pv_static(net)
+    graph_click = vis_network(
+        nodes=net.nodes,
+        edges=net.edges,
+        options=options_to_dict(net.options),
+        width=parse_px(net.width, 1200),
+        height=parse_px(net.height, 600),
+        focus_node=st.session_state.focus_key,
+        key="connected_graph",
+    )
+    if isinstance(graph_click, dict):
+        clicked_key = str(graph_click.get("clicked", ""))
+        click_ts = int(graph_click.get("ts") or 0)
+        if click_ts > st.session_state.last_click_ts:
+            st.session_state.last_click_ts = click_ts
+            if clicked_key:
+                if (
+                    clicked_key != selected_key
+                    and clicked_key not in st.session_state.expanded_keys
+                ):
+                    new_edges = build_extra_edges(
+                        song_vectors,
+                        [clicked_key],
+                        expand_k,
+                        query_key=selected_key,
+                        topk_func=_topk_func,
+                    )
+                    if not new_edges.empty:
+                        combined = pd.concat(
+                            [st.session_state.expanded_edges, new_edges],
+                            ignore_index=True,
+                        ).drop_duplicates()
+                        st.session_state.expanded_edges = combined
+                    st.session_state.expanded_keys.append(clicked_key)
+                st.session_state.focus_key = clicked_key
+                st.rerun()

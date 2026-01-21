@@ -5,4 +5,3 @@ scikit-learn
 pyarrow
 pyvis
 networkx
-stvis
