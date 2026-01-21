@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Vis Network Component</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+
+      #vis {
+        width: 800px;
+        height: 600px;
+      }
+    </style>
+    <script src="./vis-network.min.js"></script>
+  </head>
+  <body>
+    <div id="vis"></div>
+    <script type="module">
+      import { Streamlit } from "./streamlit.js";
+
+      let network = null;
+
+      function render(event) {
+        const args = event.detail.args || {};
+        const nodes = args.nodes || [];
+        const edges = args.edges || [];
+        const options = args.options || {};
+        const width = args.width || 800;
+        const height = args.height || 600;
+        const focusNode = args.focus_node || null;
+
+        const container = document.getElementById("vis");
+        container.style.width = `${width}px`;
+        container.style.height = `${height}px`;
+
+        const data = {
+          nodes: new vis.DataSet(nodes),
+          edges: new vis.DataSet(edges),
+        };
+
+        if (!network) {
+          network = new vis.Network(container, data, options);
+          network.on("click", (params) => {
+            if (params.nodes.length > 0) {
+              Streamlit.setComponentValue({
+                clicked: params.nodes[0],
+                ts: Date.now(),
+              });
+            }
+          });
+        } else {
+          network.setData(data);
+          network.setOptions(options);
+        }
+
+        if (focusNode && network.body.data.nodes.get(focusNode)) {
+          network.focus(focusNode, {
+            scale: 1.0,
+            animation: { duration: 300, easingFunction: "easeInOutQuad" },
+          });
+        }
+
+        Streamlit.setFrameHeight(height + 20);
+      }
+
+      Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, render);
+      Streamlit.setComponentReady();
+      Streamlit.setFrameHeight(600);
+    </script>
+  </body>
+</html>

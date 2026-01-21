@@ -30,8 +30,10 @@ docker compose up --build
 4. 操作
    - 曲を検索して選択
    - Top-K を指定
+   - 類似度の計算方法を選択（raw / neutral除外 / mean-center / z-score / weighted）
    - 表とグラフで類似曲を確認
-   - 必要なら2-hop展開をON
+   - グラフ上のノードをクリックして近傍を追加表示
+   - Reset graph ボタンでグラフをリセット
 
 ## ローカル実行（任意）
 
