@@ -39,13 +39,20 @@ def build_pyvis_graph(
     similarity_threshold: Optional[float] = None,
 ) -> Network:
     net = Network(height="1080px", width="1560px", bgcolor="#ffffff", font_color="#222")
-    net.barnes_hut(gravity=-15000, central_gravity=0.2, spring_length=120, spring_strength=0.02)
     net.set_options(
         """
         {
           "nodes": {
             "font": {
-              "size": 24
+              "size": 20
+            }
+          },
+          "physics": {
+            "barnesHut": {
+              "gravitationalConstant": -15000,
+              "centralGravity": 0.2,
+              "springLength": 180,
+              "springConstant": 0.02
             }
           }
         }
