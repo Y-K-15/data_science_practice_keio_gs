@@ -5,7 +5,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics.pairwise import cosine_similarity
+from annoy import AnnoyIndex
 
 EMOTION_COLUMNS = [
     "admiration",
@@ -61,6 +61,21 @@ def _get_query_index(song_vectors: pd.DataFrame, song_key: str) -> int:
     return matches[0]
 
 
+def _normalize_matrix(matrix: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-12
+    return matrix / norms
+
+
+def angular_distance_to_cosine(distance: float) -> float:
+    similarity = 1.0 - (distance * distance) / 2.0
+    if similarity > 1.0:
+        return 1.0
+    if similarity < -1.0:
+        return -1.0
+    return similarity
+
+
 def get_topk_similar(
     song_vectors: pd.DataFrame,
     song_key: str,
@@ -81,7 +96,9 @@ def get_topk_similar(
     matrix = song_vectors[EMOTION_COLUMNS].to_numpy(dtype=float)
     query_idx = _get_query_index(song_vectors, song_key)
 
-    sims = cosine_similarity(matrix[[query_idx]], matrix).flatten()
+    mat_norm = _normalize_matrix(matrix)
+    sims = mat_norm[[query_idx]] @ mat_norm.T
+    sims = sims.flatten()
     sims[query_idx] = -np.inf
 
     max_k = min(k, len(sims) - 1) if len(sims) > 1 else 0
@@ -145,7 +162,8 @@ def build_similarity_cache(
         )
 
     matrix = song_vectors[EMOTION_COLUMNS].to_numpy(dtype=float)
-    sims = cosine_similarity(matrix)
+    mat_norm = _normalize_matrix(matrix)
+    sims = mat_norm @ mat_norm.T
     np.fill_diagonal(sims, -np.inf)
 
     rows = []
@@ -166,3 +184,69 @@ def build_similarity_cache(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cache_df.to_parquet(output_path, index=False)
     return cache_df
+
+
+def build_annoy_index(
+    song_vectors: pd.DataFrame,
+    n_trees: int = 10,
+    metric: str = "angular",
+) -> tuple[AnnoyIndex, dict[str, int]]:
+    if "song_key" not in song_vectors.columns:
+        raise ValueError("song_vectors must include 'song_key'")
+
+    _ensure_emotion_columns(song_vectors, EMOTION_COLUMNS)
+
+    matrix = song_vectors[EMOTION_COLUMNS].to_numpy(dtype=float)
+    dims = matrix.shape[1]
+    index = AnnoyIndex(dims, metric)
+    for idx, vector in enumerate(matrix):
+        index.add_item(idx, vector)
+    index.build(n_trees)
+
+    keys = song_vectors["song_key"].astype(str).tolist()
+    key_to_index = {key: idx for idx, key in enumerate(keys)}
+    return index, key_to_index
+
+
+def get_topk_similar_annoy(
+    song_vectors: pd.DataFrame,
+    song_key: str,
+    k: int,
+    annoy_index: AnnoyIndex,
+    key_to_index: dict[str, int],
+) -> pd.DataFrame:
+    if k <= 0:
+        raise ValueError("k must be >= 1")
+
+    if "song_key" not in song_vectors.columns:
+        raise ValueError("song_vectors must include 'song_key'")
+
+    query_idx = key_to_index.get(str(song_key))
+    if query_idx is None:
+        raise ValueError(f"song_key not found: {song_key}")
+
+    max_items = min(k + 1, len(key_to_index))
+    if max_items <= 1:
+        return pd.DataFrame(columns=["similarity", "song_key"] + _get_meta_columns(song_vectors))
+
+    indices, distances = annoy_index.get_nns_by_item(
+        query_idx, max_items, include_distances=True
+    )
+
+    rows = []
+    for idx, dist in zip(indices, distances):
+        if idx == query_idx:
+            continue
+        rows.append((idx, angular_distance_to_cosine(float(dist))))
+        if len(rows) >= k:
+            break
+
+    if not rows:
+        return pd.DataFrame(columns=["similarity", "song_key"] + _get_meta_columns(song_vectors))
+
+    row_indices = [idx for idx, _ in rows]
+    similarities = [sim for _, sim in rows]
+    meta_cols = _get_meta_columns(song_vectors)
+    result = song_vectors.iloc[row_indices, :][["song_key"] + meta_cols].copy()
+    result.insert(0, "similarity", similarities)
+    return result.reset_index(drop=True)

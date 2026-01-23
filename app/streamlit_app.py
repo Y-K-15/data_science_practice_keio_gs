@@ -10,7 +10,13 @@ import streamlit as st
 
 from build_vectors import build_song_vectors
 from graph import build_pyvis_graph
-from recommend import EMOTION_COLUMNS, build_similarity_cache, get_topk_similar
+from recommend import (
+    EMOTION_COLUMNS,
+    build_annoy_index,
+    build_similarity_cache,
+    get_topk_similar,
+    get_topk_similar_annoy,
+)
 from vis_component import vis_network
 
 
@@ -18,6 +24,12 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_PATH = BASE_DIR / "data" / "split_song_lyrics_with_BERT2_emotions_en_100k.csv"
 VECTORS_PATH = BASE_DIR / "artifacts" / "song_vectors.parquet"
 SIM_CACHE_PATH = BASE_DIR / "artifacts" / "similarity_topk.parquet"
+ANNOY_TREES = 20
+SHOW_REBUILD_VECTORS_BUTTON = False
+SHOW_MIN_SIMILARITY_SLIDER = False
+DETAILS_VIEW_QUERY_PARAM = "view"
+DETAILS_VIEW_VALUE = "similarity_method_details"
+DETAILS_MD_PATH = BASE_DIR / "docs" / "similarity_methods_detailed.md"
 
 
 @st.cache_data(show_spinner=False)
@@ -28,6 +40,11 @@ def load_song_vectors(path: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_similarity_cache(path: str) -> pd.DataFrame:
     return pd.read_parquet(path)
+
+
+@st.cache_resource(show_spinner=False)
+def load_annoy_index(song_vectors: pd.DataFrame, n_trees: int):
+    return build_annoy_index(song_vectors, n_trees=n_trees)
 
 
 def ensure_vectors() -> None:
@@ -60,7 +77,6 @@ def format_labels(song_vectors: pd.DataFrame) -> pd.Series:
         suffix = np.where(artist != "", " - " + artist, "")
         base = base + suffix
 
-    base = base + " [" + song_vectors["song_key"].astype(str) + "]"
     return base
 
 
@@ -78,6 +94,28 @@ def get_component_ts(value: object) -> int:
         return int(value.get("ts") or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _get_query_param(name: str) -> str:
+    value = st.query_params.get(name)
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return str(value[0]) if value else ""
+    return str(value)
+
+
+def render_similarity_method_details_page() -> None:
+    st.title("Similarity method: 詳細説明")
+    if st.button("アプリに戻る", type="secondary"):
+        st.query_params.clear()
+        st.rerun()
+
+    if DETAILS_MD_PATH.exists():
+        st.markdown(DETAILS_MD_PATH.read_text(encoding="utf-8"))
+        return
+
+    st.error(f"詳細説明ファイルが見つかりません: {DETAILS_MD_PATH}")
 
 
 def options_to_dict(options) -> dict:
@@ -122,6 +160,10 @@ def empty_edges_df() -> pd.DataFrame:
 
 
 SIM_METHODS = {
+    "teammate_annoy": {
+        "label": "Annoy angular",
+        "desc": "Annoyのangular距離で近傍検索（cosine相当の近似検索）",
+    },
     "raw": {
         "label": "raw cosine",
         "desc": "28次元をそのままL2正規化してcosineを計算",
@@ -221,8 +263,33 @@ def youtube_search_url(title: str, artist: str | None, song_key: str) -> str:
 
 st.set_page_config(page_title="Emotion Similarity Explorer", layout="wide")
 
+if _get_query_param(DETAILS_VIEW_QUERY_PARAM) == DETAILS_VIEW_VALUE:
+    render_similarity_method_details_page()
+    st.stop()
+
 st.title("Emotion Similarity Explorer")
-st.caption("Mean pooled GoEmotions vectors with cosine similarity")
+
+st.markdown(
+    """
+<style>
+a.yt-btn {
+  display: inline-block;
+  padding: 0.25rem 0.5rem;
+  background: #ff0000;
+  color: #ffffff !important;
+  border-radius: 0.4rem;
+  text-decoration: none !important;
+  font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+}
+a.yt-btn:hover {
+  background: #cc0000;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 ensure_vectors()
 
@@ -271,17 +338,27 @@ max_k = max(1, min(50, len(song_vectors) - 1))
 selected_k = st.sidebar.slider("Top-K", min_value=1, max_value=max_k, value=min(10, max_k))
 
 method_keys = list(SIM_METHODS.keys())
+default_method = "teammate_annoy" if "teammate_annoy" in method_keys else method_keys[0]
 selected_method = st.sidebar.selectbox(
     "Similarity method",
     method_keys,
     format_func=lambda k: SIM_METHODS[k]["label"],
+    index=method_keys.index(default_method),
 )
 
 if "show_method_help" not in st.session_state:
     st.session_state.show_method_help = False
 
-if st.sidebar.button("説明を表示/非表示"):
+if st.sidebar.button("説明を表示/非表示", use_container_width=True):
     st.session_state.show_method_help = not st.session_state.show_method_help
+
+st.sidebar.link_button(
+    "詳細説明",
+    url=f"?{DETAILS_VIEW_QUERY_PARAM}={DETAILS_VIEW_VALUE}",
+    help="新しいタブで詳細説明を開きます",
+    type="secondary",
+    use_container_width=True,
+)
 
 if st.session_state.show_method_help:
     st.sidebar.info(
@@ -294,30 +371,33 @@ if st.session_state.show_method_help:
     )
 
 st.sidebar.subheader("Graph controls")
-expand_k = st.sidebar.slider("Expand neighbors per click", min_value=1, max_value=10, value=3)
+expand_k = st.sidebar.slider("Expand neighbors per click", min_value=1, max_value=10, value=4)
 
-similarity_threshold = st.sidebar.slider(
-    "Min similarity (graph)", min_value=0.0, max_value=1.0, value=0.0, step=0.01
-)
+similarity_threshold = 0.0
+if SHOW_MIN_SIMILARITY_SLIDER:
+    similarity_threshold = st.sidebar.slider(
+        "Min similarity (graph)", min_value=0.0, max_value=1.0, value=0.0, step=0.01
+    )
 
 cache_df = None
 if SIM_CACHE_PATH.exists():
     cache_df = load_similarity_cache(str(SIM_CACHE_PATH))
 
-if st.sidebar.button("Rebuild song vectors"):
+if SHOW_REBUILD_VECTORS_BUTTON and st.sidebar.button("Rebuild song vectors"):
     with st.spinner("Rebuilding song vectors..."):
         build_song_vectors(DATA_PATH, VECTORS_PATH)
         load_song_vectors.clear()
     st.rerun()
 
-if st.sidebar.button("Build similarity cache (current K)"):
-    with st.spinner("Building similarity cache..."):
-        try:
-            cache_df = build_similarity_cache(song_vectors, selected_k, SIM_CACHE_PATH)
-            load_similarity_cache.clear()
-        except ValueError as exc:
-            st.sidebar.error(str(exc))
-    st.rerun()
+if selected_method != "teammate_annoy":
+    if st.sidebar.button("Build similarity cache (current K)"):
+        with st.spinner("Building similarity cache..."):
+            try:
+                cache_df = build_similarity_cache(song_vectors, selected_k, SIM_CACHE_PATH)
+                load_similarity_cache.clear()
+            except ValueError as exc:
+                st.sidebar.error(str(exc))
+        st.rerun()
 
 if "expanded_keys" not in st.session_state:
     st.session_state.expanded_keys = []
@@ -348,7 +428,7 @@ if st.session_state.last_expand_k != expand_k:
     st.session_state.selected_node_key = ""
     st.session_state.last_click_ts = get_component_ts(st.session_state.get("connected_graph"))
 
-if st.sidebar.button("Reset graph"):
+if st.sidebar.button("Reset graph", use_container_width=True):
     st.session_state.expanded_keys = []
     st.session_state.expanded_edges = empty_edges_df()
     st.session_state.focus_key = selected_key
@@ -367,19 +447,36 @@ if "artist" in query_row:
     meta_lines.append(f"Artist: {query_row['artist']}")
 if "year" in query_row and pd.notna(query_row["year"]):
     meta_lines.append(f"Year: {query_row['year']}")
-meta_lines.append(f"Song key: {selected_key}")
 
 st.write(" | ".join(meta_lines))
+query_youtube_url = youtube_search_url(
+    query_row.get("title", None),
+    query_row.get("artist", None),
+    selected_key,
+)
+st.markdown(
+    f'<a class="yt-btn" href="{query_youtube_url}" target="_blank" rel="noopener noreferrer">YouTubeで見る</a>',
+    unsafe_allow_html=True,
+)
 
-neighbors = get_topk_similar(song_vectors, selected_key, selected_k, similarity_cache=cache_df)
+annoy_index = None
+annoy_key_to_index = None
 matrix_override = None
-if selected_method == "raw":
+
+if selected_method == "teammate_annoy":
+    annoy_index, annoy_key_to_index = load_annoy_index(song_vectors, ANNOY_TREES)
+    neighbors = get_topk_similar_annoy(
+        song_vectors, selected_key, selected_k, annoy_index, annoy_key_to_index
+    )
+elif selected_method == "raw":
     neighbors = get_topk_similar(
         song_vectors, selected_key, selected_k, similarity_cache=cache_df
     )
 else:
     matrix_override = prepare_matrix(song_vectors, selected_method)
-    neighbors = compute_topk_from_matrix(song_vectors, matrix_override, selected_key, selected_k)
+    neighbors = compute_topk_from_matrix(
+        song_vectors, matrix_override, selected_key, selected_k
+    )
 
 if not neighbors.empty:
     neighbors["song_key"] = neighbors["song_key"].astype(str)
@@ -405,6 +502,7 @@ else:
             for t, a, k in zip(title_col, artist_col, neighbors_view["song_key"])
         ],
     )
+    neighbors_view = neighbors_view.drop(columns=["similarity", "song_key", "n_lines"], errors="ignore")
 
     st.markdown(
         """
@@ -439,6 +537,12 @@ else:
     )
 
 def _topk_func(song_key: str, k: int) -> pd.DataFrame:
+    if selected_method == "teammate_annoy":
+        if annoy_index is None or annoy_key_to_index is None:
+            raise RuntimeError("Annoy index is not initialized.")
+        return get_topk_similar_annoy(
+            song_vectors, song_key, k, annoy_index, annoy_key_to_index
+        )
     if selected_method == "raw":
         return get_topk_similar(song_vectors, song_key, k, similarity_cache=cache_df)
     mat = matrix_override if matrix_override is not None else prepare_matrix(
@@ -462,30 +566,7 @@ else:
 
     node_key = str(st.session_state.get("selected_node_key") or "")
 
-    st.markdown(
-        """
-<style>
-a.yt-btn {
-  display: inline-block;
-  padding: 0.25rem 0.5rem;
-  background: #ff0000;
-  color: #ffffff !important;
-  border-radius: 0.4rem;
-  text-decoration: none !important;
-  font-weight: 600;
-  text-align: center;
-}
-a.yt-btn:hover {
-  background: #cc0000;
-}
-</style>
-""",
-        unsafe_allow_html=True,
-    )
-
-    if not node_key:
-        st.caption("ノードをクリックすると、詳細が表示されます。")
-    else:
+    if node_key:
         try:
             card = st.container(border=True)
         except TypeError:

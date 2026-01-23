@@ -1,5 +1,6 @@
 streamlit
 pandas
+annoy
 numpy
 scikit-learn
 pyarrow

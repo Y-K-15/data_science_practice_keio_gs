@@ -6,6 +6,17 @@ import pandas as pd
 from pyvis.network import Network
 
 
+def _scaled_neighbor_size(similarity: float, sim_min: float, sim_max: float) -> float:
+    min_size = 12.0
+    max_size = 30.0
+    if sim_max <= sim_min:
+        return max_size
+    t = (similarity - sim_min) / (sim_max - sim_min)
+    t = max(0.0, min(1.0, t))
+    t = t * t
+    return min_size + t * (max_size - min_size)
+
+
 def _safe_row(song_index: pd.DataFrame, song_key: str) -> Optional[pd.Series]:
     if song_key not in song_index.index:
         return None
@@ -72,6 +83,15 @@ def build_pyvis_graph(
     )
     nodes_added.add(str(query_key))
 
+    neighbor_sims: list[float] = []
+    for row in neighbors.itertuples(index=False):
+        sim = float(row.similarity)
+        if similarity_threshold is not None and sim < similarity_threshold:
+            continue
+        neighbor_sims.append(sim)
+    sim_min = min(neighbor_sims) if neighbor_sims else 0.0
+    sim_max = max(neighbor_sims) if neighbor_sims else 1.0
+
     for row in neighbors.itertuples(index=False):
         sim = float(row.similarity)
         if similarity_threshold is not None and sim < similarity_threshold:
@@ -87,7 +107,7 @@ def build_pyvis_graph(
                 label=label,
                 title=title,
                 color="#4c78a8",
-                size=12 + sim * 20,
+                size=_scaled_neighbor_size(sim, sim_min, sim_max),
             )
             nodes_added.add(neighbor_key)
 

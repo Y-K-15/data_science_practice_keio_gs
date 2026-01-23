@@ -7,3 +7,4 @@ services:
       - ./data:/app/data
       - ./artifacts:/app/artifacts
       - ./app:/app/app
+      - ./docs:/app/docs:ro
