@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
@@ -68,6 +69,15 @@ def parse_px(value: str, default: int) -> int:
         return int(str(value).replace("px", ""))
     except (TypeError, ValueError):
         return default
+
+
+def get_component_ts(value: object) -> int:
+    if not isinstance(value, dict):
+        return 0
+    try:
+        return int(value.get("ts") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def options_to_dict(options) -> dict:
@@ -200,6 +210,15 @@ def compute_topk_from_matrix(
     return result.reset_index(drop=True)
 
 
+def youtube_search_url(title: str, artist: str | None, song_key: str) -> str:
+    safe_title = "" if title is None or pd.isna(title) else str(title).strip()
+    safe_artist = "" if artist is None or pd.isna(artist) else str(artist).strip()
+    query = safe_title if safe_title else str(song_key)
+    if safe_artist:
+        query = f"{query} {safe_artist}"
+    return f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+
+
 st.set_page_config(page_title="Emotion Similarity Explorer", layout="wide")
 
 st.title("Emotion Similarity Explorer")
@@ -306,6 +325,8 @@ if "expanded_edges" not in st.session_state:
     st.session_state.expanded_edges = empty_edges_df()
 if "focus_key" not in st.session_state:
     st.session_state.focus_key = selected_key
+if "selected_node_key" not in st.session_state:
+    st.session_state.selected_node_key = ""
 if "last_click_ts" not in st.session_state:
     st.session_state.last_click_ts = 0
 if "last_expand_k" not in st.session_state:
@@ -316,20 +337,23 @@ if st.session_state.get("current_query_key") != selected_key:
     st.session_state.expanded_keys = []
     st.session_state.expanded_edges = empty_edges_df()
     st.session_state.focus_key = selected_key
-    st.session_state.last_click_ts = 0
+    st.session_state.selected_node_key = ""
+    st.session_state.last_click_ts = get_component_ts(st.session_state.get("connected_graph"))
 
 if st.session_state.last_expand_k != expand_k:
     st.session_state.last_expand_k = expand_k
     st.session_state.expanded_keys = []
     st.session_state.expanded_edges = empty_edges_df()
     st.session_state.focus_key = selected_key
-    st.session_state.last_click_ts = 0
+    st.session_state.selected_node_key = ""
+    st.session_state.last_click_ts = get_component_ts(st.session_state.get("connected_graph"))
 
 if st.sidebar.button("Reset graph"):
     st.session_state.expanded_keys = []
     st.session_state.expanded_edges = empty_edges_df()
     st.session_state.focus_key = selected_key
-    st.session_state.last_click_ts = 0
+    st.session_state.selected_node_key = ""
+    st.session_state.last_click_ts = get_component_ts(st.session_state.get("connected_graph"))
     st.rerun()
 
 query_row = get_song_row(song_index, selected_key)
@@ -364,7 +388,55 @@ st.subheader("Top-K similar songs")
 if neighbors.empty:
     st.info("No neighbors found.")
 else:
-    st.dataframe(neighbors, use_container_width=True)
+    neighbors_view = neighbors.copy()
+    if "title" in neighbors_view.columns:
+        title_col = neighbors_view["title"]
+    else:
+        title_col = pd.Series([""] * len(neighbors_view))
+    if "artist" in neighbors_view.columns:
+        artist_col = neighbors_view["artist"]
+    else:
+        artist_col = pd.Series([None] * len(neighbors_view))
+    neighbors_view.insert(
+        len(neighbors_view.columns),
+        "youtube",
+        [
+            youtube_search_url(t, a, k)
+            for t, a, k in zip(title_col, artist_col, neighbors_view["song_key"])
+        ],
+    )
+
+    st.markdown(
+        """
+<style>
+[data-testid="stDataFrame"] a {
+  display: inline-block;
+  padding: 0.25rem 0.5rem;
+  background: #ff0000;
+  color: #ffffff !important;
+  border-radius: 0.4rem;
+  text-decoration: none !important;
+  font-weight: 600;
+}
+[data-testid="stDataFrame"] a:hover {
+  background: #cc0000;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+    st.dataframe(
+        neighbors_view,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "youtube": st.column_config.LinkColumn(
+                "YouTube",
+                help="YouTube検索結果を開きます",
+                display_text="YouTubeで見る",
+            )
+        },
+    )
 
 def _topk_func(song_key: str, k: int) -> pd.DataFrame:
     if selected_method == "raw":
@@ -374,44 +446,87 @@ def _topk_func(song_key: str, k: int) -> pd.DataFrame:
     )
     return compute_topk_from_matrix(song_vectors, mat, song_key, k)
 
-extra_edges = None
-if not st.session_state.expanded_edges.empty:
-    extra_edges = st.session_state.expanded_edges
-
 st.subheader("Connected graph")
-st.caption("Click a node to expand its neighborhood. Use Reset graph to clear.")
+st.caption("ノードをクリックすると詳細が表示されます。「拡張する」で近傍を追加できます。")
 if neighbors.empty:
     st.info("Select a song with available neighbors to render the graph.")
 else:
-    net = build_pyvis_graph(
-        song_index,
-        selected_key,
-        neighbors,
-        extra_edges=extra_edges,
-        similarity_threshold=similarity_threshold if similarity_threshold > 0 else None,
-    )
-    graph_click = vis_network(
-        nodes=net.nodes,
-        edges=net.edges,
-        options=options_to_dict(net.options),
-        width=parse_px(net.width, 1200),
-        height=parse_px(net.height, 600),
-        focus_node=st.session_state.focus_key,
-        key="connected_graph",
-    )
-    if isinstance(graph_click, dict):
-        clicked_key = str(graph_click.get("clicked", ""))
-        click_ts = int(graph_click.get("ts") or 0)
-        if click_ts > st.session_state.last_click_ts:
+    graph_state = st.session_state.get("connected_graph")
+    if isinstance(graph_state, dict):
+        clicked_key = str(graph_state.get("clicked", ""))
+        click_ts = get_component_ts(graph_state)
+        if clicked_key and click_ts > st.session_state.last_click_ts:
             st.session_state.last_click_ts = click_ts
-            if clicked_key:
-                if (
-                    clicked_key != selected_key
-                    and clicked_key not in st.session_state.expanded_keys
+            st.session_state.selected_node_key = clicked_key
+            st.session_state.focus_key = clicked_key
+
+    node_key = str(st.session_state.get("selected_node_key") or "")
+
+    st.markdown(
+        """
+<style>
+a.yt-btn {
+  display: inline-block;
+  padding: 0.25rem 0.5rem;
+  background: #ff0000;
+  color: #ffffff !important;
+  border-radius: 0.4rem;
+  text-decoration: none !important;
+  font-weight: 600;
+  text-align: center;
+}
+a.yt-btn:hover {
+  background: #cc0000;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    if not node_key:
+        st.caption("ノードをクリックすると、詳細が表示されます。")
+    else:
+        try:
+            card = st.container(border=True)
+        except TypeError:
+            card = st.container()
+
+        with card:
+            node_row = get_song_row(song_index, node_key) if node_key in song_index.index else None
+            node_title = ""
+            node_artist = ""
+            if node_row is not None:
+                node_title = (
+                    "" if pd.isna(node_row.get("title", "")) else str(node_row.get("title", "")).strip()
+                )
+                node_artist = (
+                    "" if pd.isna(node_row.get("artist", "")) else str(node_row.get("artist", "")).strip()
+                )
+
+            display_title = node_title if node_title else node_key
+            st.markdown(f"**{display_title}**")
+            if node_artist:
+                st.write(f"Artist: {node_artist}")
+            st.caption(f"song_key: {node_key}")
+
+            youtube_url = youtube_search_url(node_title, node_artist, node_key)
+            cols = st.columns([1, 1])
+            with cols[0]:
+                st.markdown(
+                    f'<a class="yt-btn" href="{youtube_url}" target="_blank" rel="noopener noreferrer">YouTubeで見る</a>',
+                    unsafe_allow_html=True,
+                )
+            with cols[1]:
+                can_expand = node_key != selected_key and node_key not in st.session_state.expanded_keys
+                if st.button(
+                    "拡張する",
+                    disabled=not can_expand,
+                    use_container_width=True,
+                    key="expand_selected_node",
                 ):
                     new_edges = build_extra_edges(
                         song_vectors,
-                        [clicked_key],
+                        [node_key],
                         expand_k,
                         query_key=selected_key,
                         topk_func=_topk_func,
@@ -422,6 +537,28 @@ else:
                             ignore_index=True,
                         ).drop_duplicates()
                         st.session_state.expanded_edges = combined
-                    st.session_state.expanded_keys.append(clicked_key)
-                st.session_state.focus_key = clicked_key
-                st.rerun()
+                    if node_key not in st.session_state.expanded_keys and node_key != selected_key:
+                        st.session_state.expanded_keys.append(node_key)
+                    st.session_state.focus_key = node_key
+
+    extra_edges = (
+        None
+        if st.session_state.expanded_edges.empty
+        else st.session_state.expanded_edges
+    )
+    net = build_pyvis_graph(
+        song_index,
+        selected_key,
+        neighbors,
+        extra_edges=extra_edges,
+        similarity_threshold=similarity_threshold if similarity_threshold > 0 else None,
+    )
+    vis_network(
+        nodes=net.nodes,
+        edges=net.edges,
+        options=options_to_dict(net.options),
+        width=parse_px(net.width, 1200),
+        height=parse_px(net.height, 600),
+        focus_node=st.session_state.focus_key,
+        key="connected_graph",
+    )
