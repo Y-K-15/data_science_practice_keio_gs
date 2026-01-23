@@ -23,7 +23,14 @@ def _make_label(row: Optional[pd.Series], song_key: str) -> tuple[str, str]:
     artist = str(row.get("artist", "")) if pd.notna(row.get("artist", "")) else ""
     year = str(row.get("year", "")) if pd.notna(row.get("year", "")) else ""
 
-    label = title if title else str(song_key)
+    # 라벨에 아티스트 포함
+    if title and artist:
+        label = f"{title}\n{artist}"
+    elif title:
+        label = title
+    else:
+        label = str(song_key)
+    
     parts = [part for part in [title, artist, year] if part]
     tooltip = " / ".join(parts) if parts else f"song_key: {song_key}"
     if parts:
@@ -38,13 +45,38 @@ def build_pyvis_graph(
     extra_edges: Optional[pd.DataFrame] = None,
     similarity_threshold: Optional[float] = None,
 ) -> Network:
-    net = Network(height="1080px", width="1560px", bgcolor="#ffffff", font_color="#222")
+    net = Network(height="800px", width="100%", bgcolor="#f8f9fa", font_color="#2c3e50")
     net.set_options(
         """
         {
           "nodes": {
             "font": {
-              "size": 20
+              "size": 16,
+              "face": "Arial, sans-serif",
+              "color": "#2c3e50"
+            },
+            "borderWidth": 2,
+            "borderWidthSelected": 3,
+            "shadow": {
+              "enabled": true,
+              "color": "rgba(0,0,0,0.15)",
+              "size": 8,
+              "x": 2,
+              "y": 2
+            },
+            "shape": "dot"
+          },
+          "edges": {
+            "color": {
+              "color": "rgba(150,150,150,0.4)",
+              "highlight": "#6366f1",
+              "hover": "#818cf8"
+            },
+            "width": 1.5,
+            "smooth": {
+              "enabled": true,
+              "type": "continuous",
+              "roundness": 0.5
             }
           },
           "physics": {
@@ -67,8 +99,15 @@ def build_pyvis_graph(
         str(query_key),
         label=query_label,
         title=query_title,
-        color="#ff8c00",
-        size=32,
+        color={
+            "background": "#8b5cf6",
+            "border": "#7c3aed",
+            "highlight": {
+                "background": "#a78bfa",
+                "border": "#8b5cf6"
+            }
+        },
+        size=35,
     )
     nodes_added.add(str(query_key))
 
@@ -86,7 +125,14 @@ def build_pyvis_graph(
                 neighbor_key,
                 label=label,
                 title=title,
-                color="#4c78a8",
+                color={
+                    "background": "#3b82f6",
+                    "border": "#2563eb",
+                    "highlight": {
+                        "background": "#60a5fa",
+                        "border": "#3b82f6"
+                    }
+                },
                 size=12 + sim * 20,
             )
             nodes_added.add(neighbor_key)
@@ -115,8 +161,15 @@ def build_pyvis_graph(
                         key,
                         label=label,
                         title=title,
-                        color="#72b7b2",
-                        size=10,
+                        color={
+                            "background": "#10b981",
+                            "border": "#059669",
+                            "highlight": {
+                                "background": "#34d399",
+                                "border": "#10b981"
+                            }
+                        },
+                        size=12,
                     )
                     nodes_added.add(key)
 
